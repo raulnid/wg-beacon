@@ -3,12 +3,13 @@ package main
 import (
 	"log"
 	"time"
-
-	"wg-beacon/internal/config"
 )
 
 func main() {
-	cfg := config.New()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
 
 	app, err := NewApp(cfg)
 	if err != nil {
@@ -18,6 +19,6 @@ func main() {
 		if err := app.Run(); err != nil {
 			log.Println(err)
 		}
-		time.Sleep(300 * time.Second)
+		time.Sleep(cfg.Interval)
 	}
 }

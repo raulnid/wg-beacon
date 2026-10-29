@@ -2,12 +2,13 @@ package main
 
 import (
 	"log"
-
-	"wg-beacon/internal/config"
 )
 
 func main() {
-	cfg := config.New()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
 
 	app, err := NewApp(cfg)
 	if err != nil {

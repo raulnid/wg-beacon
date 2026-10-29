@@ -1,6 +1,5 @@
-server/pem/*
-client/pem/*
-server/.env
-client/.env
-server/wg-beacon
-client/wg-beacon
+pem/
+.env
+/wg-beacon-client
+/wg-beacon-server
+/server/wg-beacon

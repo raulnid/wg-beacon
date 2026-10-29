@@ -10,18 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"wg-beacon/internal/config"
 
 	"golang.org/x/crypto/nacl/box"
 )
 
 type App struct {
-	cfg        *config.Config
+	cfg        *Config
 	publicKey  [32]byte
 	privateKey [32]byte
 }
 
-func NewApp(cfg *config.Config) (*App, error) {
+func NewApp(cfg *Config) (*App, error) {
 	log.Printf("listening on %s", cfg.Port)
 	return &App{cfg: cfg}, nil
 }

@@ -10,16 +10,15 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"wg-beacon/internal/config"
 
 	"golang.org/x/crypto/nacl/box"
 )
 
 type App struct {
-	cfg *config.Config
+	cfg *Config
 }
 
-func NewApp(cfg *config.Config) (*App, error) {
+func NewApp(cfg *Config) (*App, error) {
 	log.Printf("trying to connect to %s:%s", cfg.Host, cfg.Port)
 	return &App{cfg: cfg}, nil
 }

@@ -38,7 +38,7 @@ spec:
         container('kaniko') {
           // hub.xzr.es is served by the gateway with a step-ca cert, so trust the Homelab Root CA
           sh '''
-            /kaniko/executor --context=dir://$WORKSPACE/client --dockerfile=Dockerfile \
+            /kaniko/executor --context=dir://$WORKSPACE --dockerfile=Dockerfile \
               --destination=$IMAGE:${GIT_COMMIT:0:7} --destination=$IMAGE:latest \
               --registry-certificate=hub.xzr.es=/kaniko/homelab-root-ca/ca.crt
           '''
