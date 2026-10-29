@@ -7,20 +7,43 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/nacl/box"
 )
 
+const (
+	httpTimeout = 10 * time.Second
+	ipifyURL    = "https://api.ipify.org"
+)
+
 type App struct {
-	cfg *Config
+	cfg    *Config
+	peer   [32]byte
+	priv   [32]byte
+	client *http.Client
 }
 
 func NewApp(cfg *Config) (*App, error) {
+	serverPublic, err := readKey("pem/server_public")
+	if err != nil {
+		return nil, fmt.Errorf("reading server public key: %w", err)
+	}
+	clientPrivate, err := readKey("pem/client_private")
+	if err != nil {
+		return nil, fmt.Errorf("reading client private key: %w", err)
+	}
 	log.Printf("trying to connect to %s:%s", cfg.Host, cfg.Port)
-	return &App{cfg: cfg}, nil
+	return &App{
+		cfg:    cfg,
+		peer:   serverPublic,
+		priv:   clientPrivate,
+		client: &http.Client{Timeout: httpTimeout},
+	}, nil
 }
 
 func readKey(path string) ([32]byte, error) {
@@ -41,39 +64,52 @@ func readKey(path string) ([32]byte, error) {
 }
 
 func (a *App) Run() error {
-
-	publicKey, err := readKey("pem/server_public")
+	ip, err := a.fetchPublicIP()
 	if err != nil {
-		return err
+		return fmt.Errorf("fetching public IP: %w", err)
 	}
-	privateKey, err := readKey("pem/client_private")
-	if err != nil {
-		return err
-	}
-
-	resp, err := http.Get("https://api.ipify.org")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	message, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
 	var nonce [24]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return err
+		return fmt.Errorf("generating nonce: %w", err)
 	}
+	msg := box.Seal(nonce[:], []byte(ip), &nonce, &a.peer, &a.priv)
+	if err := a.postIP(msg); err != nil {
+		return fmt.Errorf("reporting IP to server: %w", err)
+	}
+	return nil
+}
 
-	encrypted := box.Seal(nonce[:], message, &nonce, &publicKey, &privateKey)
-
-	resp, err = http.Post(fmt.Sprintf("http://%s:%s/%s", a.cfg.Host, a.cfg.Port, a.cfg.Endpoint), "application/octet-stream", bytes.NewBuffer(encrypted))
+func (a *App) fetchPublicIP() (string, error) {
+	resp, err := a.client.Get(ipifyURL)
 	if err != nil {
-		log.Println(err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status %s", resp.Status)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(string(raw))
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid IP %q", ip)
+	}
+	return ip, nil
+}
+
+func (a *App) postIP(msg []byte) error {
+	url := fmt.Sprintf("http://%s/%s", net.JoinHostPort(a.cfg.Host, a.cfg.Port), a.cfg.Endpoint)
+	resp, err := a.client.Post(url, "application/octet-stream", bytes.NewReader(msg))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %s", resp.Status)
+	}
 	return nil
 }
