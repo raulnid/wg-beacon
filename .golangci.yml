@@ -1,0 +1,9 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+  exclusions:
+    presets:
+      - std-error-handling # unchecked defer resp.Body.Close() and friends
