@@ -1,129 +1,129 @@
 package main
 
 import (
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
-	"golang.org/x/crypto/nacl/box"
+	"wg-beacon/internal/beacon"
 )
 
+const maxBodySize = 256
+
+// runner runs a command and returns its stdout; swapped out in tests.
+type runner func(name string, args ...string) ([]byte, error)
+
+func execRunner(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).Output() //nolint:gosec // args are config values and a validated IP
+}
+
 type App struct {
-	cfg        *Config
-	publicKey  [32]byte
-	privateKey [32]byte
+	cfg  *Config
+	keys beacon.Keys
+	run  runner
+
+	mu   sync.Mutex // guards last and serializes endpoint updates
+	last int64      // timestamp of the last accepted message
 }
 
 func NewApp(cfg *Config) (*App, error) {
-	log.Printf("listening on %s", cfg.Port)
-	return &App{cfg: cfg}, nil
+	clientPublic, err := beacon.ReadKey("pem/client_public")
+	if err != nil {
+		return nil, fmt.Errorf("reading client public key: %w", err)
+	}
+	serverPrivate, err := beacon.ReadKey("pem/server_private")
+	if err != nil {
+		return nil, fmt.Errorf("reading server private key: %w", err)
+	}
+	return &App{
+		cfg:  cfg,
+		keys: beacon.Keys{Peer: clientPublic, Private: serverPrivate},
+		run:  execRunner,
+	}, nil
 }
 
-func readKey(path string) ([32]byte, error) {
-	var key [32]byte
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return key, err
-	}
-	decoded, err := hex.DecodeString(strings.TrimSpace(string(raw)))
-	if err != nil {
-		return key, err
-	}
-	if len(decoded) != 32 {
-		return key, fmt.Errorf("key at %s must be 32 bytes, got %d", path, len(decoded))
-	}
-	copy(key[:], decoded)
-	return key, nil
+func (a *App) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /"+a.cfg.Endpoint, a.handleUpdateIP)
+	return mux
 }
 
 func (a *App) handleUpdateIP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodySize))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
 
-	if len(body) < 24 {
-		http.Error(w, "Body too short", http.StatusBadRequest)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	ip, ts, err := beacon.Open(body, time.Now(), a.last, a.keys)
+	switch {
+	case errors.Is(err, beacon.ErrMalformed):
+		http.Error(w, "Malformed message", http.StatusBadRequest)
+		return
+	case err != nil:
+		log.Printf("rejected message from %s: %v", r.RemoteAddr, err) //nolint:gosec // RemoteAddr is host:port set by net/http
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	a.last = ts
 
-	var nonce [24]byte
-	copy(nonce[:], body[:24])
-	encrypted := body[24:]
-
-	decrypted, ok := box.Open(nil, encrypted, &nonce, &a.publicKey, &a.privateKey)
-	if !ok {
-		http.Error(w, "Failed to decrypt", http.StatusUnauthorized)
-		return
-	}
-
-	log.Printf("Decrypted:\n %s\n", decrypted)
-	if net.ParseIP(string(decrypted)) == nil {
-		http.Error(w, "Invalid IP address", http.StatusBadRequest)
-		return
-	}
-	if err := a.changeWireguardConfig(string(decrypted)); err != nil {
-		http.Error(w, "Failed to update Wireguard configuration", http.StatusInternalServerError)
+	if err := a.setEndpoint(ip); err != nil {
+		log.Printf("setting endpoint: %v", err)
+		http.Error(w, "Failed to update WireGuard endpoint", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-func (a *App) changeWireguardConfig(ip string) error {
-	conf, err := os.ReadFile("/etc/wireguard/wg0.conf")
+// setEndpoint points the configured peer at ip:PEER_PORT, doing nothing if it already is.
+func (a *App) setEndpoint(ip string) error {
+	ep := net.JoinHostPort(ip, a.cfg.PeerPort)
+	out, err := a.run("wg", "show", a.cfg.Interface, "endpoints")
 	if err != nil {
-		log.Printf("failed to read configuration: %v", err)
-		return err
+		return fmt.Errorf("wg show %s endpoints: %w", a.cfg.Interface, err)
 	}
 
-	lines := strings.Split(string(conf), "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(line, "Endpoint =") {
-			parts := strings.Split(line, ":")
-			port := parts[len(parts)-1]
-			lines[i] = fmt.Sprintf("Endpoint = %s:%s", ip, port)
+	found := false
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == a.cfg.PeerPublicKey {
+			if f[1] == ep {
+				return nil
+			}
+			found = true
+			break
 		}
 	}
-	newConf := strings.Join(lines, "\n")
-
-	if err := os.WriteFile("/etc/wireguard/wg0.conf", []byte(newConf), 0600); err != nil {
-		log.Printf("failed to write configuration: %v", err)
-		return err
+	// wg set would silently create a missing peer.
+	if !found {
+		return fmt.Errorf("peer %s is not configured on %s", a.cfg.PeerPublicKey, a.cfg.Interface)
 	}
 
-	if err := exec.Command("wg-quick", "down", "wg0").Run(); err != nil {
-		log.Printf("failed to sync configuration: %v", err)
-		return err
+	if _, err := a.run("wg", "set", a.cfg.Interface, "peer", a.cfg.PeerPublicKey, "endpoint", ep); err != nil {
+		return fmt.Errorf("wg set: %w", err)
 	}
-
-	if err := exec.Command("wg-quick", "up", "wg0").Run(); err != nil {
-		log.Printf("failed to sync configuration: %v", err)
-		return err
-	}
-
+	log.Printf("endpoint of %s set to %s", a.cfg.PeerPublicKey, ep)
 	return nil
 }
 
 func (a *App) Run() error {
-
-	var err error
-	a.publicKey, err = readKey("pem/client_public")
-	if err != nil {
-		return err
+	server := &http.Server{
+		Addr:              ":" + a.cfg.Port,
+		Handler:           a.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
 	}
-	a.privateKey, err = readKey("pem/server_private")
-	if err != nil {
-		return err
-	}
-
-	http.HandleFunc("/"+a.cfg.Endpoint, a.handleUpdateIP)
-
-	return http.ListenAndServe(fmt.Sprintf(":%s", a.cfg.Port), nil)
+	log.Printf("listening on %s", server.Addr)
+	return server.ListenAndServe()
 }

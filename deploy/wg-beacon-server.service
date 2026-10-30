@@ -1,0 +1,20 @@
+[Unit]
+Description=wg-beacon server (updates the WireGuard peer endpoint)
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+User=wg-beacon
+WorkingDirectory=/etc/wg-beacon
+ExecStart=/usr/local/bin/wg-beacon-server
+# only `wg show` / `wg set` are run, which need CAP_NET_ADMIN and nothing else
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
